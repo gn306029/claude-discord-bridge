@@ -3,12 +3,14 @@
 // Reads the hook payload from stdin and forwards it to Discord. Runs async
 // from the hook, so it must never block or throw in a way that affects the
 // Claude Code session - always exit 0.
-import 'dotenv/config';
+import { config } from 'dotenv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-process.chdir(__dirname); // so dotenv picks up our .env regardless of hook cwd
+process.chdir(__dirname);
+// 明確指定 .env 路徑：hook 的 cwd 是專案目錄，不能依賴 dotenv/config 的預設查找
+config({ path: path.join(__dirname, '.env') });
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
