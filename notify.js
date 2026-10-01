@@ -15,7 +15,8 @@ process.chdir(__dirname);
 config({ path: path.join(__dirname, '.env') });
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
-const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+// bot 啟動時會把本裝置專屬頻道寫進 state.json；讀不到才退回 .env 的備援頻道
+const CHANNEL_ID = readBotChannel() ?? process.env.DISCORD_CHANNEL_ID;
 const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
 const SKIP_TYPES = new Set(
   (process.env.NOTIFY_SKIP_TYPES ?? 'idle_prompt').split(',').map((s) => s.trim()).filter(Boolean),
@@ -69,9 +70,17 @@ async function main() {
   const lines = [`**${label}**`];
   if (payload.message) lines.push(payload.message);
   if (payload.cwd) lines.push(`專案: \`${payload.cwd}\``);
-  if (payload.session_id) lines.push(`session: \`${payload.session_id.slice(0, 8)}\``);
+  if (payload.session_id) lines.push(`session: \`${payload.session_id}\``);
 
   await postToDiscord(lines.join('\n'));
+}
+
+function readBotChannel() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'state.json'), 'utf8'))._channel?.id ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function formatAskUserQuestion(payload) {
@@ -85,13 +94,14 @@ function formatAskUserQuestion(payload) {
     }
   }
   if (questions.length === 0) lines.push('（無法解析問題內容，請回到終端機查看）');
+  if (payload.session_id) lines.push(`session: \`${payload.session_id}\``);
   return lines.join('\n');
 }
 
 function formatStop(payload) {
   const lines = ['**✅ Claude 已完成這輪工作**'];
   if (payload.cwd) lines.push(`專案: \`${payload.cwd}\``);
-  if (payload.session_id) lines.push(`session: \`${payload.session_id.slice(0, 8)}\``);
+  if (payload.session_id) lines.push(`session: \`${payload.session_id}\``);
   const summary = getLastAssistantText(payload);
   if (summary) {
     const max = 1900 - lines.join('\n').length - DEVICE_NAME.length - 40;

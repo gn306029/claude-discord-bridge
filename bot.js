@@ -1,24 +1,27 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
 import { execFile } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { listRecentSessions, formatRelativeTime } from './lib/sessions.js';
+import { listRecentSessions, formatRelativeTime, findSession } from './lib/sessions.js';
 import { computeUsage, formatUsageReport } from './lib/usage.js';
+import { channelNameFor, parseSessionMarker, sessionFooter, normalizeList } from './lib/bridge.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, 'state.json');
 
 const TOKEN = requireEnv('DISCORD_BOT_TOKEN');
 const ALLOWED_USER_ID = requireEnv('DISCORD_ALLOWED_USER_ID');
-const ALLOWED_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null;
+const FALLBACK_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null;
+const GUILD_ID = process.env.DISCORD_GUILD_ID || null;
 const IS_WIN = process.platform === 'win32';
 const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
-const isTarget = (name) => !!name && name.toLowerCase() === DEVICE_NAME.toLowerCase();
-const BUILTIN_COMMANDS = new Set(['help', 'devices', 'device', 'sessions', 'use', 'new', 'usage', 'status']);
 const tag = (text) => `🖥️ **[${DEVICE_NAME}]**\n${text}`;
+
+// 本裝置專屬頻道，clientReady 後由 resolveChannel() 決定；在那之前只接受 DM。
+let CHANNEL_ID = null;
 
 function requireEnv(name) {
     const v = process.env[name];
@@ -58,7 +61,7 @@ function saveState() {
     writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 function getUserState(userId) {
-    if (!state[userId]) state[userId] = { activeSessionId: null, lastList: [] };
+    if (!state[userId]) state[userId] = { activeSessionId: null, activeCwd: null, lastList: [] };
     return state[userId];
 }
 
@@ -72,9 +75,60 @@ const client = new Client({
     partials: [Partials.Channel],
 });
 
-client.once('clientReady', () => {
+client.once('clientReady', async () => {
     console.log(`[discord-bridge] 裝置 ${DEVICE_NAME}，已登入為 ${client.user.tag}，等待來自 ${ALLOWED_USER_ID} 的訊息`);
+    try {
+        CHANNEL_ID = await resolveChannel();
+    } catch (err) {
+        console.error('[discord-bridge] 解析專屬頻道失敗', err);
+    }
+    if (!CHANNEL_ID && FALLBACK_CHANNEL_ID) CHANNEL_ID = FALLBACK_CHANNEL_ID;
+    if (CHANNEL_ID) {
+        // notify.js 是獨立行程，靠這個檔案得知要發到哪個頻道
+        state._channel = { id: CHANNEL_ID, device: DEVICE_NAME };
+        saveState();
+    }
+    console.log(`[discord-bridge] 使用頻道 ${CHANNEL_ID ?? '(無，僅接受 DM)'}`);
 });
+
+// 找（或建立）這台裝置專屬的頻道；失敗時回傳 null，交給備援頻道，不讓 bot 崩潰。
+async function resolveChannel() {
+    let guild = null;
+    if (GUILD_ID) {
+        guild = await client.guilds.fetch(GUILD_ID);
+    } else if (FALLBACK_CHANNEL_ID) {
+        const ch = await client.channels.fetch(FALLBACK_CHANNEL_ID).catch(() => null);
+        guild = ch?.guild ?? null;
+    }
+    if (!guild) {
+        console.warn('[discord-bridge] 無法判斷 guild，請設定 DISCORD_GUILD_ID 或 DISCORD_CHANNEL_ID');
+        return null;
+    }
+    const channels = await guild.channels.fetch();
+    const name = channelNameFor(DEVICE_NAME);
+    const saved = state._channel?.device === DEVICE_NAME ? channels.get(state._channel.id) : null;
+    if (saved) {
+        // 命名規則調整後，順手把既有頻道改成新名稱（失敗就維持原名）
+        if (saved.name !== name) await saved.setName(name).catch(() => { });
+        return saved.id;
+    }
+
+    const existing = channels.find((c) => c && c.type === ChannelType.GuildText && c.name === name);
+    if (existing) return existing.id;
+
+    try {
+        const created = await guild.channels.create({
+            name,
+            type: ChannelType.GuildText,
+            topic: `Claude Code 橋接：${DEVICE_NAME}（${process.platform}）`,
+        });
+        console.log(`[discord-bridge] 已建立頻道 #${created.name}`);
+        return created.id;
+    } catch (err) {
+        console.warn(`[discord-bridge] 無法建立頻道（缺少 Manage Channels 權限？），改用 DISCORD_CHANNEL_ID：${err.message}`);
+        return null;
+    }
+}
 
 client.on('messageCreate', async (message) => {
     try {
@@ -92,38 +146,13 @@ async function handleMessage(message) {
     if (message.author.id !== ALLOWED_USER_ID) return;
 
     const isDM = message.channel.isDMBased?.() ?? false;
-    if (ALLOWED_CHANNEL_ID && !isDM && message.channel.id !== ALLOWED_CHANNEL_ID) return;
+    if (!isDM && message.channel.id !== CHANNEL_ID) return;
 
-    let content = message.content.trim();
+    const content = message.content.trim();
     if (!content) return;
 
     const userState = getUserState(message.author.id);
 
-    // 多裝置路由：每台電腦各跑一份 bot，都會收到同一則訊息，各自判斷是否輪到自己。
-    if (content === '!devices') {
-        const mark = isTarget(userState.targetDevice) ? '（目前指定）' : '';
-        await message.reply(`🖥️ **${DEVICE_NAME}** ${process.platform} ${os.hostname()}${mark}`);
-        return;
-    }
-    if (content.startsWith('!device ')) {
-        const name = content.slice(8).trim();
-        userState.targetDevice = name;
-        saveState();
-        if (isTarget(name)) await message.reply(`✅ 已指定由這台（**${DEVICE_NAME}**）執行之後的指令。`);
-        return;
-    }
-    // 一次性指定的兩種寫法：`@名稱 內容` 或 `!名稱 內容`（名稱不是內建指令時才視為裝置）
-    const at = content.match(/^@(\S+)\s+([\s\S]+)$/)
-        ?? (() => {
-            const m = content.match(/^!(\S+)\s+([\s\S]+)$/);
-            return m && !BUILTIN_COMMANDS.has(m[1].toLowerCase()) ? m : null;
-        })();
-    if (at) {
-        if (!isTarget(at[1])) return;
-        content = at[2].trim(); // 一次性指定，不改變 !device 的目標
-    } else if (!isTarget(userState.targetDevice)) {
-        return;
-    }
     const origReply = message.reply.bind(message);
     message.reply = (c) => origReply(typeof c === 'string' ? tag(c) : c);
 
@@ -134,7 +163,7 @@ async function handleMessage(message) {
 
     if (content === '!sessions' || content.startsWith('!sessions ')) {
         const sessions = await listRecentSessions(15);
-        userState.lastList = sessions.map((s) => s.sessionId);
+        userState.lastList = sessions.map((s) => ({ sessionId: s.sessionId, cwd: s.realCwd }));
         saveState();
         if (sessions.length === 0) {
             await message.reply('找不到任何 session 紀錄。');
@@ -152,11 +181,14 @@ async function handleMessage(message) {
 
     if (content.startsWith('!use ')) {
         const idx = parseInt(content.slice(5).trim(), 10);
-        if (!idx || idx < 1 || idx > userState.lastList.length) {
+        const list = normalizeList(userState.lastList);
+        if (!idx || idx < 1 || idx > list.length) {
             await message.reply('編號無效，請先用 `!sessions` 取得最新清單。');
             return;
         }
-        userState.activeSessionId = userState.lastList[idx - 1];
+        userState.activeSessionId = list[idx - 1].sessionId;
+        userState.activeCwd = list[idx - 1].cwd;
+        userState.pendingNewProject = null;
         saveState();
         await message.reply(`已切換到 session \`${userState.activeSessionId.slice(0, 8)}\`，之後的訊息會接續這個對話。`);
         return;
@@ -169,6 +201,7 @@ async function handleMessage(message) {
             return;
         }
         userState.activeSessionId = null;
+        userState.activeCwd = null;
         userState.pendingNewProject = projectPath;
         saveState();
         await message.reply(`好，下一則訊息會在 \`${projectPath}\` 開啟一個全新的對話。`);
@@ -176,19 +209,19 @@ async function handleMessage(message) {
     }
 
     if (content === '!usage') {
-    const placeholder = await message.reply('⏳ 掃描本機 session 紀錄中...');
-    const data = await computeUsage();
-    await placeholder.edit(tag(formatUsageReport(data)).slice(0, 1900));
-    return;
-  }
+        const placeholder = await message.reply('⏳ 掃描本機 session 紀錄中...');
+        const data = await computeUsage();
+        await placeholder.edit(tag(formatUsageReport(data)).slice(0, 1900));
+        return;
+    }
 
-  if (content === '!status') {
+    if (content === '!status') {
         await message.reply(
             userState.activeSessionId
-                ? `目前接續 session \`${userState.activeSessionId.slice(0, 8)}\``
+                ? `目前接續 session \`${userState.activeSessionId.slice(0, 8)}\`${userState.activeCwd ? `（${userState.activeCwd}）` : ''}`
                 : userState.pendingNewProject
                     ? `下一則訊息將在 \`${userState.pendingNewProject}\` 開新對話`
-                    : '尚未選擇任何對話，請用 `!sessions` + `!use` 或 `!new <路徑>`。',
+                    : '尚未選擇任何對話，請用 `!sessions` + `!use`、`!new <路徑>`，或直接回覆某則通知。',
         );
         return;
     }
@@ -198,27 +231,49 @@ async function handleMessage(message) {
         return;
     }
 
+    // 回覆某則通知／bot 訊息時，依該訊息內的 session 標記決定要接續哪個對話。
+    if (message.reference?.messageId) {
+        const ref = await message.fetchReference().catch(() => null);
+        const marker = ref && ref.author.id === client.user.id ? parseSessionMarker(ref.content) : null;
+        if (marker) {
+            const found = await findSession(marker);
+            if (!found) {
+                await message.reply(`找不到 session \`${marker.slice(0, 8)}\`（紀錄可能已刪除）。`);
+                return;
+            }
+            userState.activeSessionId = found.sessionId;
+            userState.activeCwd = found.cwd;
+            userState.pendingNewProject = null;
+            saveState();
+        }
+    }
+
     if (!userState.activeSessionId && !userState.pendingNewProject) {
-        await message.reply('尚未選擇對話。請先 `!sessions` 查看清單並 `!use <編號>`，或 `!new <專案路徑>` 開新對話。');
+        await message.reply('尚未選擇對話。請先 `!sessions` 查看清單並 `!use <編號>`，或 `!new <專案路徑>` 開新對話，或直接回覆某則通知。');
         return;
     }
 
     const placeholder = await message.reply('⏳ 執行中...');
     const { args, cwd } = buildArgs(userState, content);
-    const { ok, text } = await runClaude(args, cwd);
+    const { ok, text, sessionId } = await runClaude(args, cwd);
 
-    if (userState.pendingNewProject && ok) {
+    if (ok && sessionId) {
+        // 新對話第一輪完成後，之後的訊息自動接續同一個 session
+        if (userState.pendingNewProject) userState.activeCwd = userState.pendingNewProject;
+        userState.activeSessionId = sessionId;
         userState.pendingNewProject = null;
     }
     saveState();
 
-    await sendChunked(placeholder, ok ? text : `❌ 執行失敗:\n${text}`);
+    await sendChunked(placeholder, ok ? text : `❌ 執行失敗:\n${text}`, ok ? sessionId : null);
 }
 
 function buildArgs(userState, prompt) {
-    const common = ['-p', '--output-format', 'json', '--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
+    const common = ['-p', '--output-format', 'json', '--permission-mode', 'dontAsk'];
     if (userState.activeSessionId) {
-        return { args: ['--resume', userState.activeSessionId, ...common, prompt], cwd: __dirname };
+        // session 依專案目錄存放，必須在原本的 cwd 下才找得到
+        const cwd = userState.activeCwd && existsSync(userState.activeCwd) ? userState.activeCwd : __dirname;
+        return { args: ['--resume', userState.activeSessionId, ...common, prompt], cwd };
     }
     return { args: [...common, prompt], cwd: userState.pendingNewProject };
 }
@@ -245,13 +300,13 @@ function runClaude(args, cwd) {
     });
 }
 
-async function sendChunked(placeholderMessage, text) {
+async function sendChunked(placeholderMessage, text, sessionId) {
+    // 每個分段都附上 session 標記，回覆任何一段都能接續對話
+    const footer = sessionFooter(sessionId);
+    const size = 1800 - footer.length;
+    const body = tag(text || '(沒有輸出)');
     const chunks = [];
-    let remaining = tag(text || '(沒有輸出)');
-    while (remaining.length > 0) {
-        chunks.push(remaining.slice(0, 1900));
-        remaining = remaining.slice(1900);
-    }
+    for (let i = 0; i < body.length; i += size) chunks.push(body.slice(i, i + size) + footer);
     await placeholderMessage.edit(chunks[0]);
     for (let i = 1; i < chunks.length; i += 1) {
         await placeholderMessage.channel.send(chunks[i]);
@@ -260,16 +315,14 @@ async function sendChunked(placeholderMessage, text) {
 
 function helpText() {
     return [
-        '**可用指令**',
-        '`!devices` - 列出所有在線裝置（每台各回一則）',
-        '`!device <名稱>` - 指定之後由哪台電腦執行（其他台會忽略訊息）',
-        '`@<名稱> <指令或文字>` - 只這一次交給指定電腦，例如 `@home !sessions` 或 `!home !sessions`',
+        '**可用指令**（每台裝置有自己的頻道，直接在該頻道操作即可）',
         '`!sessions` - 列出最近的對話',
         '`!use <編號>` - 接續 !sessions 清單中的某個對話',
         '`!new <專案路徑>` - 在指定專案開新對話',
         '`!usage` - 查看本機 token 用量統計（估算，非官方額度資料）',
         '`!status` - 查看目前接續的對話',
         '直接傳文字 - 送給目前選擇的對話當作新 prompt',
+        '**回覆**某則通知或 bot 訊息 - 自動接續該訊息所屬的對話',
     ].join('\n');
 }
 

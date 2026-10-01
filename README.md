@@ -37,7 +37,8 @@ Cross-project, cross-platform Discord integration for Claude Code.
    - The channel ID you'll use (right-click the channel -> Copy Channel ID) -
      optional if you'll only use DMs
 4. `cp .env.example .env` and fill in `DISCORD_BOT_TOKEN`,
-   `DISCORD_ALLOWED_USER_ID`, `DISCORD_CHANNEL_ID`.
+   `DISCORD_ALLOWED_USER_ID`, `DISCORD_GUILD_ID`, `DEVICE_NAME`
+   (`DISCORD_CHANNEL_ID` 為備援，可留空).
 5. `npm install`
 6. The `Notification` hook is already wired into your global
    `~/.claude/settings.json` (applies to every project automatically) -
@@ -46,11 +47,18 @@ Cross-project, cross-platform Discord integration for Claude Code.
 
 ## Discord commands (bot.js)
 
+每台裝置（bot 行程）有自己的頻道 `claude-<DEVICE_NAME>`，啟動時自動建立（需
+**Manage Channels** 權限；沒有權限時退回 `DISCORD_CHANNEL_ID`）。在哪個頻道說話就由
+哪台電腦處理，不需要指定裝置。通知也會發到該裝置自己的頻道。
+
+- **回覆**任何通知或 bot 訊息 - 自動接續該訊息所屬的 session（訊息內有
+  `session: <id>` 標記），並設為目前使用中的對話。
 - `!sessions` - list your most recent Claude Code sessions across every
   project on this machine.
 - `!use <number>` - continue the session at that number from the last
   `!sessions` list.
-- `!new <project-path>` - start a brand new conversation in that project.
+- `!new <project-path>` - start a brand new conversation in that project
+  (第一輪完成後自動接續該 session).
 - `!usage` - local token usage tally, summed from every session transcript
   under `~/.claude/projects/` (same approach as the community
   [phuryn/claude-usage](https://github.com/phuryn/claude-usage) tool). This
