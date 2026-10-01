@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { listRecentSessions, formatRelativeTime, findSession } from './lib/sessions.js';
 import { computeUsage, formatUsageReport } from './lib/usage.js';
 import { channelNameFor, parseSessionMarker, sessionFooter, normalizeList } from './lib/bridge.js';
+import { parseAskMarker, parseButtonId, parseReplyAnswers, renderAsk, isComplete } from './lib/ask.js';
+import { readPending, recordAnswers } from './lib/pending.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE = path.join(__dirname, 'state.json');
@@ -52,7 +54,8 @@ const LOCK_FILE = path.join(__dirname, 'bot.lock');
 if (existsSync(LOCK_FILE)) {
     const oldPid = parseInt(readFileSync(LOCK_FILE, 'utf8'), 10);
     let alive = false;
-    try { process.kill(oldPid, 0); alive = oldPid !== process.pid; } catch { /* 已不存在 */ }
+    // EPERM 代表行程存在但沒有權限查詢（例如由其他權限啟動），同樣視為仍在執行
+    try { process.kill(oldPid, 0); alive = oldPid !== process.pid; } catch (err) { alive = err.code === 'EPERM'; }
     if (alive) {
         console.error(`[discord-bridge] 已有另一個 bot 在執行 (pid ${oldPid})，本行程結束。`);
         process.exit(1);
@@ -145,6 +148,30 @@ async function resolveChannel() {
     }
 }
 
+// 按下問題訊息上的選項按鈕。多台裝置共用同一個 bot token，所以只處理自己頻道的互動。
+client.on('interactionCreate', async (interaction) => {
+    try {
+        if (!interaction.isButton() || interaction.channelId !== CHANNEL_ID) return;
+        const b = parseButtonId(interaction.customId);
+        if (!b) return;
+        if (interaction.user.id !== ALLOWED_USER_ID) {
+            await interaction.reply({ content: '你沒有權限操作這個按鈕。', ephemeral: true });
+            return;
+        }
+        const pending = readPending(b.id);
+        const label = pending?.questions[b.q]?.options?.[b.o]?.label;
+        if (!pending || label === undefined) {
+            await interaction.update({ content: tag('⌛ 這個問題已逾時或已處理，請回電腦上作答。'), components: [] });
+            return;
+        }
+        const updated = recordAnswers(b.id, { [b.q]: label }) ?? pending;
+        const view = renderAsk(updated, isComplete(updated) ? 'done' : 'open');
+        await interaction.update({ content: tag(view.content), components: view.components });
+    } catch (err) {
+        console.error('[discord-bridge] interactionCreate error', err);
+    }
+});
+
 client.on('messageCreate', async (message) => {
     try {
         await handleMessage(message);
@@ -230,6 +257,23 @@ async function handleMessage(message) {
         return;
     }
 
+    if (content === '!away' || content.startsWith('!away ')) {
+        const arg = content.slice(5).trim().toLowerCase();
+        if (arg === 'on' || arg === 'off') {
+            state._away = arg === 'on';
+            saveState();
+        } else if (arg) {
+            await message.reply('用法：`!away on`、`!away off` 或 `!away` 查看目前狀態。');
+            return;
+        }
+        await message.reply(
+            state._away
+                ? `🚶 離開模式：**開**。Claude 的選項會發到這裡等你作答（最長 ${process.env.ASK_WAIT_SECONDS || 300} 秒，逾時才回到電腦上的對話框）。`
+                : '🖥️ 離開模式：**關**。選項直接顯示在電腦上，Discord 只收到通知。',
+        );
+        return;
+    }
+
     if (content === '!status') {
         await message.reply(
             userState.activeSessionId
@@ -249,7 +293,27 @@ async function handleMessage(message) {
     // 回覆某則通知／bot 訊息時，依該訊息內的 session 標記決定要接續哪個對話。
     if (message.reference?.messageId) {
         const ref = await message.fetchReference().catch(() => null);
-        const marker = ref && ref.author.id === client.user.id ? parseSessionMarker(ref.content) : null;
+        const fromBot = !!ref && ref.author.id === client.user.id;
+
+        // 回覆「等待作答的問題」：把回覆當成答案交給正在等待的 hook，不送進 claude。
+        const askId = fromBot ? parseAskMarker(ref.content) : null;
+        const pending = askId ? readPending(askId) : null;
+        if (pending && !isComplete(pending)) {
+            const answers = parseReplyAnswers(content, pending.questions);
+            if (!answers) {
+                await message.reply('格式不符。單題：回覆編號或文字；多題：每題一行；多選用逗號（如 `1,3`）。');
+                return;
+            }
+            const done = recordAnswers(askId, answers);
+            if (done) {
+                const view = renderAsk(done, 'done');
+                await ref.edit({ content: tag(view.content), components: [] }).catch(() => { });
+                await message.react('✅').catch(() => { });
+            }
+            return;
+        }
+
+        const marker = fromBot ? parseSessionMarker(ref.content) : null;
         if (marker) {
             const found = await findSession(marker);
             if (!found) {
@@ -339,6 +403,7 @@ function helpText() {
         '`!new <專案路徑>` - 在指定專案開新對話',
         '`!usage` - 查看本機 token 用量統計（估算，非官方額度資料）',
         '`!status` - 查看目前接續的對話',
+        '`!away on|off` - 離開模式：開啟時 Claude 的選項會發到這裡等你作答（按鈕或回覆），關閉時直接在電腦上選',
         '直接傳文字 - 送給目前選擇的對話當作新 prompt',
         '**回覆**某則通知或 bot 訊息 - 自動接續該訊息所屬的對話',
     ].join('\n');

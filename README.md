@@ -67,6 +67,10 @@ Cross-project, cross-platform Discord integration for Claude Code.
   and don't work under `-p`/headless mode - confirmed by testing). It's a
   best-effort local token count, labeled as such in the reply.
 - `!status` - show what's currently selected.
+- `!away on|off` - 離開模式。開啟時，Claude 的 AskUserQuestion 選項會發到這個頻道（附按鈕，也可**回覆**編號／文字作答），
+  你的答案會直接回給電腦上正在等待的 Claude Code，不用回到 VSCode 點選。等不到答案（預設 300 秒，`ASK_WAIT_SECONDS`）
+  就退回電腦上原本的選項對話框。關閉時（預設）選項直接顯示在電腦上，Discord 只收到通知。
+  注意：AskUserQuestion 的 hook 必須是**同步**的（不能加 `async`，timeout 要大於 `ASK_WAIT_SECONDS`），下方設定已是如此。
 - Anything else - sent as a prompt to whichever session/project you selected.
 
 ## Security
@@ -101,7 +105,7 @@ This whole folder is self-contained:
   {
     "matcher": "AskUserQuestion",
     "hooks": [
-      { "type": "command", "command": "node \"$HOME/.claude/discord-bridge/notify.js\"", "shell": "bash", "timeout": 10, "async": true }
+      { "type": "command", "command": "node \"$HOME/.claude/discord-bridge/notify.js\"", "shell": "bash", "timeout": 330 }
     ]
   }
 ],

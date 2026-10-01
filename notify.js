@@ -8,6 +8,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { newAskId, renderAsk, isComplete, finalAnswers } from './lib/ask.js';
+import { writePending, readPending, removePending } from './lib/pending.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 process.chdir(__dirname);
@@ -16,7 +18,8 @@ config({ path: path.join(__dirname, '.env') });
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 // bot 啟動時會把本裝置專屬頻道寫進 state.json；讀不到才退回 .env 的備援頻道
-const CHANNEL_ID = readBotChannel() ?? process.env.DISCORD_CHANNEL_ID;
+const CHANNEL_ID = readBotState()._channel?.id ?? process.env.DISCORD_CHANNEL_ID;
+const ASK_WAIT_SECONDS = Number(process.env.ASK_WAIT_SECONDS) || 300;
 const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
 const SKIP_TYPES = new Set(
   (process.env.NOTIFY_SKIP_TYPES ?? 'idle_prompt').split(',').map((s) => s.trim()).filter(Boolean),
@@ -52,9 +55,12 @@ async function main() {
 
   // AskUserQuestion has no Notification-hook coverage upstream, so we
   // forward it from PreToolUse instead (settings.json only matches this
-  // hook on tool_name === "AskUserQuestion" - never block/alter the tool).
+  // hook on tool_name === "AskUserQuestion").
+  // 離開模式（Discord 的 !away on）：同步等待 Discord 作答並替 Claude Code 回答；
+  // 否則只是通知，不攔截，選項照常顯示在電腦上。
   if (hookEvent === 'PreToolUse' && payload.tool_name === 'AskUserQuestion') {
-    await postToDiscord(formatAskUserQuestion(payload));
+    if (readBotState()._away === true) await askViaDiscord(payload);
+    else await postToDiscord(formatAskUserQuestion(payload));
     return;
   }
 
@@ -75,11 +81,49 @@ async function main() {
   await postToDiscord(lines.join('\n'));
 }
 
-function readBotChannel() {
+// bot 寫的 state.json：_channel（專屬頻道）與 _away（離開模式）
+function readBotState() {
   try {
-    return JSON.parse(fs.readFileSync(path.join(__dirname, 'state.json'), 'utf8'))._channel?.id ?? null;
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'state.json'), 'utf8'));
   } catch {
-    return null;
+    return {};
+  }
+}
+
+// 把問題發到 Discord 並等待答案（按鈕或回覆，由 bot.js 寫入 pending 檔）。
+// 有答案就輸出 hook 決定，讓 Claude Code 直接採用；逾時或失敗則什麼都不輸出，
+// 交還給電腦上原本的選項對話框。
+async function askViaDiscord(payload) {
+  const questions = payload.tool_input?.questions ?? [];
+  if (questions.length === 0) return;
+  const pending = { id: newAskId(), questions, answers: {}, session_id: payload.session_id, cwd: payload.cwd };
+  writePending(pending);
+  const first = renderAsk(pending);
+  const msg = await postToDiscord(first.content, first.components);
+  if (!msg?.id) {
+    removePending(pending.id);
+    return;
+  }
+  const deadline = Date.now() + ASK_WAIT_SECONDS * 1000;
+  try {
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const cur = readPending(pending.id);
+      if (cur && isComplete(cur)) {
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            updatedInput: { ...payload.tool_input, answers: finalAnswers(cur) },
+          },
+        }));
+        return;
+      }
+    }
+    const final = renderAsk(readPending(pending.id) ?? pending, 'timeout');
+    await editDiscord(msg.id, final.content, final.components);
+  } finally {
+    removePending(pending.id);
   }
 }
 
@@ -141,30 +185,46 @@ function readStdin() {
     let data = '';
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (chunk) => (data += chunk));
-    process.stdin.on('end', () => resolve(data));
-    process.stdin.on('error', () => resolve(data));
-    setTimeout(() => resolve(data), 5000); // never hang waiting on stdin
+    // 讀完就清掉保險計時器，否則同步 hook 每次都要白等 5 秒才結束
+    const guard = setTimeout(() => resolve(data), 5000); // never hang waiting on stdin
+    const finish = () => { clearTimeout(guard); resolve(data); };
+    process.stdin.on('end', finish);
+    process.stdin.on('error', finish);
   });
 }
 
-async function postToDiscord(content) {
+// 回傳 Discord 訊息物件（失敗回傳 null）。components 為按鈕列。
+function postToDiscord(content, components) {
+  return callDiscord('POST', `/channels/${CHANNEL_ID}/messages`, content, components);
+}
+
+function editDiscord(messageId, content, components) {
+  return callDiscord('PATCH', `/channels/${CHANNEL_ID}/messages/${messageId}`, content, components);
+}
+
+async function callDiscord(method, apiPath, content, components) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch(`https://discord.com/api/v10/channels/${CHANNEL_ID}/messages`, {
-      method: 'POST',
+    const body = { content: `🖥️ **[${DEVICE_NAME}]**\n${content}`.slice(0, 1900) };
+    if (components) body.components = components;
+    const res = await fetch(`https://discord.com/api/v10${apiPath}`, {
+      method,
       headers: {
         Authorization: `Bot ${TOKEN}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ content: `🖥️ **[${DEVICE_NAME}]**\n${content}`.slice(0, 1900) }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (!res.ok) {
       console.error('[discord-bridge] Discord API error', res.status, await res.text());
+      return null;
     }
+    return await res.json();
   } catch (err) {
     console.error('[discord-bridge] failed to post notification', err?.message ?? err);
+    return null;
   } finally {
     clearTimeout(timer);
   }
