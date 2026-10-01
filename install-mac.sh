@@ -49,12 +49,26 @@ fi
 # Clear any stale registration from a previous failed attempt, then load.
 # "Could not find" from bootout here is expected/harmless when nothing was
 # loaded yet - it is not treated as a failure.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "請不要用 sudo 執行：LaunchAgent 必須安裝在你自己的登入帳號底下。" >&2
+  exit 1
+fi
+
+# 先把舊的服務和任何手動啟動的 bot.js 都清掉，避免重複行程。
 launchctl bootout "$UID_GUI/$LABEL" >/dev/null 2>&1 || true
+launchctl unload "$PLIST" >/dev/null 2>&1 || true
+pkill -f "$BRIDGE_DIR/bot.js" >/dev/null 2>&1 || true
+pkill -f "node bot.js" >/dev/null 2>&1 || true
+rm -f "$BRIDGE_DIR/bot.lock"
+sleep 2
 launchctl enable "$UID_GUI/$LABEL" >/dev/null 2>&1 || true
 
 if ! launchctl bootstrap "$UID_GUI" "$PLIST"; then
-  echo "launchctl bootstrap 失敗，請把上面的錯誤訊息回報給 Claude（不要假設這樣就是裝好了）。" >&2
-  exit 1
+  echo "bootstrap 失敗，改用 launchctl load -w 重試..." >&2
+  if ! launchctl load -w "$PLIST"; then
+    echo "launchctl 載入失敗，請把上面的錯誤訊息回報給 Claude（不要假設這樣就是裝好了）。" >&2
+    exit 1
+  fi
 fi
 
 if ! launchctl list | grep -q "$LABEL"; then

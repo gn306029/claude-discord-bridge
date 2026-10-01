@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials } from 'discord.js';
 import { execFile } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +17,7 @@ const ALLOWED_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null;
 const IS_WIN = process.platform === 'win32';
 const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
 const isTarget = (name) => !!name && name.toLowerCase() === DEVICE_NAME.toLowerCase();
+const BUILTIN_COMMANDS = new Set(['help', 'devices', 'device', 'sessions', 'use', 'new', 'usage', 'status']);
 const tag = (text) => `🖥️ **[${DEVICE_NAME}]**\n${text}`;
 
 function requireEnv(name) {
@@ -27,6 +28,23 @@ function requireEnv(name) {
     }
     return v;
 }
+
+// 單一實例鎖：避免重複啟動造成同一則訊息被多個（甚至舊版）行程重複回覆。
+const LOCK_FILE = path.join(__dirname, 'bot.lock');
+if (existsSync(LOCK_FILE)) {
+    const oldPid = parseInt(readFileSync(LOCK_FILE, 'utf8'), 10);
+    let alive = false;
+    try { process.kill(oldPid, 0); alive = oldPid !== process.pid; } catch { /* 已不存在 */ }
+    if (alive) {
+        console.error(`[discord-bridge] 已有另一個 bot 在執行 (pid ${oldPid})，本行程結束。`);
+        process.exit(1);
+    }
+}
+writeFileSync(LOCK_FILE, String(process.pid));
+process.on('exit', () => {
+    try { if (readFileSync(LOCK_FILE, 'utf8') === String(process.pid)) unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+});
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
 
 let state = {};
 if (existsSync(STATE_FILE)) {
@@ -94,7 +112,12 @@ async function handleMessage(message) {
         if (isTarget(name)) await message.reply(`✅ 已指定由這台（**${DEVICE_NAME}**）執行之後的指令。`);
         return;
     }
-    const at = content.match(/^@(\S+)\s+([\s\S]+)$/);
+    // 一次性指定的兩種寫法：`@名稱 內容` 或 `!名稱 內容`（名稱不是內建指令時才視為裝置）
+    const at = content.match(/^@(\S+)\s+([\s\S]+)$/)
+        ?? (() => {
+            const m = content.match(/^!(\S+)\s+([\s\S]+)$/);
+            return m && !BUILTIN_COMMANDS.has(m[1].toLowerCase()) ? m : null;
+        })();
     if (at) {
         if (!isTarget(at[1])) return;
         content = at[2].trim(); // 一次性指定，不改變 !device 的目標
@@ -240,7 +263,7 @@ function helpText() {
         '**可用指令**',
         '`!devices` - 列出所有在線裝置（每台各回一則）',
         '`!device <名稱>` - 指定之後由哪台電腦執行（其他台會忽略訊息）',
-        '`@<名稱> <指令或文字>` - 只這一次交給指定電腦，例如 `@home !sessions`',
+        '`@<名稱> <指令或文字>` - 只這一次交給指定電腦，例如 `@home !sessions` 或 `!home !sessions`',
         '`!sessions` - 列出最近的對話',
         '`!use <編號>` - 接續 !sessions 清單中的某個對話',
         '`!new <專案路徑>` - 在指定專案開新對話',
