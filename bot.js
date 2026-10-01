@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials, ChannelType } from 'discord.js';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +17,21 @@ const ALLOWED_USER_ID = requireEnv('DISCORD_ALLOWED_USER_ID');
 const FALLBACK_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null;
 const GUILD_ID = process.env.DISCORD_GUILD_ID || null;
 const IS_WIN = process.platform === 'win32';
+// 從 Discord 觸發的 claude 以 dontAsk 執行：只有明確允許的工具能跑，其餘一律拒絕。
+// 預設允許改檔與本機 git（不含 push）；可用 CLAUDE_ALLOWED_TOOLS（逗號分隔）覆寫，設為 none 則全部拒絕。
+const DEFAULT_ALLOWED_TOOLS = [
+    'Edit', 'Write',
+    'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git add:*)', 'Bash(git commit:*)',
+].join(',');
+const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ?? DEFAULT_ALLOWED_TOOLS).trim();
+// 原生 claude.exe 不需要 shell（用 shell 時訊息中的 & | 等字元會被 cmd 解讀）；
+// 只有 npm 安裝的 claude.cmd 才必須經過 shell。
+const CLAUDE_NEEDS_SHELL = IS_WIN && (() => {
+    try {
+        const first = execFileSync('where', ['claude'], { encoding: 'utf8' }).split(/\r?\n/)[0].trim();
+        return /\.(cmd|bat)$/i.test(first);
+    } catch { return false; }
+})();
 const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
 const tag = (text) => `🖥️ **[${DEVICE_NAME}]**\n${text}`;
 
@@ -270,6 +285,8 @@ async function handleMessage(message) {
 
 function buildArgs(userState, prompt) {
     const common = ['-p', '--output-format', 'json', '--permission-mode', 'dontAsk'];
+    // 必須用 = 連接，否則 --allowedTools（可接多個值）會把後面的 prompt 吃掉
+    if (ALLOWED_TOOLS && ALLOWED_TOOLS !== 'none') common.push(`--allowedTools=${ALLOWED_TOOLS}`);
     if (userState.activeSessionId) {
         // session 依專案目錄存放，必須在原本的 cwd 下才找得到
         const cwd = userState.activeCwd && existsSync(userState.activeCwd) ? userState.activeCwd : __dirname;
@@ -280,10 +297,10 @@ function buildArgs(userState, prompt) {
 
 function runClaude(args, cwd) {
     return new Promise((resolve) => {
-        execFile(
+        const child = execFile(
             'claude',
             args,
-            { cwd, shell: IS_WIN, timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 },
+            { cwd, shell: CLAUDE_NEEDS_SHELL, timeout: 10 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 },
             (err, stdout, stderr) => {
                 if (err) {
                     resolve({ ok: false, text: (stderr || err.message || '未知錯誤').slice(0, 1800) });
@@ -297,6 +314,7 @@ function runClaude(args, cwd) {
                 }
             },
         );
+        child.stdin.end(); // 不關閉的話 claude 會等 3 秒 stdin 才開始
     });
 }
 

@@ -71,6 +71,9 @@ Cross-project, cross-platform Discord integration for Claude Code.
 
 ## Security
 
+Discord 觸發的對話預設允許 `Edit`、`Write` 與本機 git（status/diff/log/add/commit，**不含 push**），
+其餘仍被拒絕；可用 `.env` 的 `CLAUDE_ALLOWED_TOOLS` 調整，`none` 為唯讀。以下為原始說明：
+
 The bot only ever acts on messages from `DISCORD_ALLOWED_USER_ID`. Anyone
 else's messages (even in the same channel) are silently ignored. Prompts run
 with `--permission-mode dontAsk`, which **denies** anything that would
