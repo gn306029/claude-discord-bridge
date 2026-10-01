@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials } from 'discord.js';
 import { execFile } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { listRecentSessions, formatRelativeTime } from './lib/sessions.js';
@@ -14,6 +15,9 @@ const TOKEN = requireEnv('DISCORD_BOT_TOKEN');
 const ALLOWED_USER_ID = requireEnv('DISCORD_ALLOWED_USER_ID');
 const ALLOWED_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || null;
 const IS_WIN = process.platform === 'win32';
+const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
+const isTarget = (name) => !!name && name.toLowerCase() === DEVICE_NAME.toLowerCase();
+const tag = (text) => `🖥️ **[${DEVICE_NAME}]**\n${text}`;
 
 function requireEnv(name) {
     const v = process.env[name];
@@ -51,7 +55,7 @@ const client = new Client({
 });
 
 client.once('clientReady', () => {
-    console.log(`[discord-bridge] 已登入為 ${client.user.tag}，等待來自 ${ALLOWED_USER_ID} 的訊息`);
+    console.log(`[discord-bridge] 裝置 ${DEVICE_NAME}，已登入為 ${client.user.tag}，等待來自 ${ALLOWED_USER_ID} 的訊息`);
 });
 
 client.on('messageCreate', async (message) => {
@@ -72,10 +76,33 @@ async function handleMessage(message) {
     const isDM = message.channel.isDMBased?.() ?? false;
     if (ALLOWED_CHANNEL_ID && !isDM && message.channel.id !== ALLOWED_CHANNEL_ID) return;
 
-    const content = message.content.trim();
+    let content = message.content.trim();
     if (!content) return;
 
     const userState = getUserState(message.author.id);
+
+    // 多裝置路由：每台電腦各跑一份 bot，都會收到同一則訊息，各自判斷是否輪到自己。
+    if (content === '!devices') {
+        const mark = isTarget(userState.targetDevice) ? '（目前指定）' : '';
+        await message.reply(`🖥️ **${DEVICE_NAME}** ${process.platform} ${os.hostname()}${mark}`);
+        return;
+    }
+    if (content.startsWith('!device ')) {
+        const name = content.slice(8).trim();
+        userState.targetDevice = name;
+        saveState();
+        if (isTarget(name)) await message.reply(`✅ 已指定由這台（**${DEVICE_NAME}**）執行之後的指令。`);
+        return;
+    }
+    const at = content.match(/^@(\S+)\s+([\s\S]+)$/);
+    if (at) {
+        if (!isTarget(at[1])) return;
+        content = at[2].trim(); // 一次性指定，不改變 !device 的目標
+    } else if (!isTarget(userState.targetDevice)) {
+        return;
+    }
+    const origReply = message.reply.bind(message);
+    message.reply = (c) => origReply(typeof c === 'string' ? tag(c) : c);
 
     if (content === '!help') {
         await message.reply(helpText());
@@ -128,7 +155,7 @@ async function handleMessage(message) {
     if (content === '!usage') {
     const placeholder = await message.reply('⏳ 掃描本機 session 紀錄中...');
     const data = await computeUsage();
-    await placeholder.edit(formatUsageReport(data).slice(0, 1900));
+    await placeholder.edit(tag(formatUsageReport(data)).slice(0, 1900));
     return;
   }
 
@@ -197,7 +224,7 @@ function runClaude(args, cwd) {
 
 async function sendChunked(placeholderMessage, text) {
     const chunks = [];
-    let remaining = text || '(沒有輸出)';
+    let remaining = tag(text || '(沒有輸出)');
     while (remaining.length > 0) {
         chunks.push(remaining.slice(0, 1900));
         remaining = remaining.slice(1900);
@@ -211,6 +238,9 @@ async function sendChunked(placeholderMessage, text) {
 function helpText() {
     return [
         '**可用指令**',
+        '`!devices` - 列出所有在線裝置（每台各回一則）',
+        '`!device <名稱>` - 指定之後由哪台電腦執行（其他台會忽略訊息）',
+        '`@<名稱> <指令或文字>` - 只這一次交給指定電腦，例如 `@home !sessions`',
         '`!sessions` - 列出最近的對話',
         '`!use <編號>` - 接續 !sessions 清單中的某個對話',
         '`!new <專案路徑>` - 在指定專案開新對話',

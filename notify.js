@@ -4,6 +4,8 @@
 // from the hook, so it must never block or throw in a way that affects the
 // Claude Code session - always exit 0.
 import { config } from 'dotenv';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,6 +16,7 @@ config({ path: path.join(__dirname, '.env') });
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const DEVICE_NAME = process.env.DEVICE_NAME || os.hostname();
 const SKIP_TYPES = new Set(
   (process.env.NOTIFY_SKIP_TYPES ?? 'idle_prompt').split(',').map((s) => s.trim()).filter(Boolean),
 );
@@ -89,7 +92,38 @@ function formatStop(payload) {
   const lines = ['**✅ Claude 已完成這輪工作**'];
   if (payload.cwd) lines.push(`專案: \`${payload.cwd}\``);
   if (payload.session_id) lines.push(`session: \`${payload.session_id.slice(0, 8)}\``);
+  const summary = getLastAssistantText(payload);
+  if (summary) {
+    const max = 1900 - lines.join('\n').length - DEVICE_NAME.length - 40;
+    lines.push('', summary.length > max ? `${summary.slice(0, max)}…` : summary);
+  }
   return lines.join('\n');
+}
+
+// Stop payload carries last_assistant_message on recent Claude Code versions;
+// fall back to scanning the transcript JSONL for the last assistant text.
+function getLastAssistantText(payload) {
+  if (typeof payload.last_assistant_message === 'string' && payload.last_assistant_message.trim()) {
+    return payload.last_assistant_message.trim();
+  }
+  try {
+    if (!payload.transcript_path) return '';
+    const rows = fs.readFileSync(payload.transcript_path, 'utf8').split('\n');
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (!rows[i].trim()) continue;
+      let entry;
+      try { entry = JSON.parse(rows[i]); } catch { continue; }
+      if (entry.type !== 'assistant') continue;
+      const content = entry.message?.content;
+      const text = Array.isArray(content)
+        ? content.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim()
+        : typeof content === 'string' ? content.trim() : '';
+      if (text) return text;
+    }
+  } catch {
+    // transcript unreadable - send notification without summary
+  }
+  return '';
 }
 
 function readStdin() {
@@ -113,7 +147,7 @@ async function postToDiscord(content) {
         Authorization: `Bot ${TOKEN}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ content: content.slice(0, 1900) }),
+      body: JSON.stringify({ content: `🖥️ **[${DEVICE_NAME}]**\n${content}`.slice(0, 1900) }),
       signal: controller.signal,
     });
     if (!res.ok) {
